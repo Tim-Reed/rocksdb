@@ -20,6 +20,7 @@
 #include "rocksdb/write_buffer_manager.h"
 #include "table/mock_table.h"
 #include "test_util/mock_time_env.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/string_util.h"
@@ -363,6 +364,47 @@ TEST_F(WalManagerTest, WalIteratorNewFileWhileScanning) {
   ASSERT_EQ(i, 300);
   ASSERT_TRUE(iter->status().ok());
 }
+
+#ifndef NDEBUG  // SyncPoint is a no-op in release builds
+TEST_F(WalManagerTest, GetUpdatesSinceSkipsConcurrentlyPurgedWAL) {
+  Init(nullptr /* clock_override */);
+
+  // Create two archived WALs: 000001.log holds seq 1-100, 000002.log holds
+  // seq 101-200.
+  CreateArchiveLogs(2, 100);
+
+  // Reproduce issue #5763: PurgeObsoleteWALFiles deletes an archived WAL in
+  // the window between ReadFirstRecord() and GetFileSize() during WAL
+  // discovery. Delete archived WAL #1 the first time the sync point is hit
+  // while scanning the archive directory.
+  bool deleted = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WalManager::GetSortedWalsOfType:1", [&](void*) {
+        if (!deleted) {
+          deleted = true;
+          ASSERT_OK(env_->DeleteFile(ArchivedLogFileName(dbname_, 1)));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::unique_ptr<WalIterator> iter;
+  Status s = wal_manager_->GetUpdatesSince(
+      0, &iter, WalIterator::ReadOptions(), versions_.get());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // The vanished WAL must be skipped silently rather than surfaced as an I/O
+  // error.
+  ASSERT_OK(s);
+  ASSERT_FALSE(s.IsIOError());
+  ASSERT_TRUE(deleted);
+  // The iterator resumes at WAL #2, having skipped WAL #1's seq 1-100.
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(101U, iter->GetBatch().sequence);
+  ASSERT_EQ(100, CountRecords(iter.get()));
+}
+#endif  // NDEBUG
 
 }  // namespace ROCKSDB_NAMESPACE
 

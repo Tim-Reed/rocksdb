@@ -349,6 +349,14 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
           }
         }
       }
+      // The WAL could have been deleted concurrently (e.g. by
+      // WalManager::PurgeObsoleteWALFiles) since it was listed above. Treat a
+      // vanished WAL as no longer available and skip it, consistent with the
+      // documented GetUpdatesSince() semantics and with ReadFirstRecord()
+      // above.
+      if (s.IsPathNotFound()) {
+        continue;
+      }
       if (!s.ok()) {
         return s;
       }
